@@ -1,0 +1,1107 @@
+// Prisma schema — Stage 1 of the MongoDB → Supabase (Postgres) migration.
+//
+// Converted 1:1 from the 23 real Mongoose models in server/src/models/*.ts
+// (verified by reading each file, not assumed). Two Mongoose embedded-array
+// concepts (Organization.dealStages / .customFields / .activityTypes, and
+// Deal.products) become real child tables here — see the design notes above
+// DealStageConfig / CustomFieldConfig / ActivityTypeConfig / DealProduct
+// below for why. Every other embedded object that is opaque/variable-shaped
+// and never queried by its inner fields (aiScore, customFields, content,
+// before/after/metadata, config, data, generatedContent, scoreBreakdown,
+// filters) stays as a Json column — converting those to child tables would
+// add relational overhead with no query benefit, since the app only ever
+// reads/writes them as a single blob.
+//
+// Multi-tenant isolation: every tenant-owned table has organizationId with
+// an index (several also compound-index it with the field they're most
+// commonly filtered by, mirroring the original Mongoose indexes exactly).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────
+
+enum Industry {
+  SaaS
+  RealEstate    @map("Real Estate")
+  Consulting
+  Manufacturing
+  Other
+}
+
+enum BusinessModel {
+  B2B
+  B2C
+  B2B2C
+  Marketplace
+  Other
+}
+
+enum CustomFieldEntity {
+  lead
+  contact
+  company
+  deal
+}
+
+enum CustomFieldType {
+  text
+  number
+  date
+  boolean
+  select
+}
+
+enum UserRole {
+  sales_rep
+  sales_manager
+  sales_director
+  admin
+}
+
+enum LeadStatus {
+  new
+  contacted
+  qualifying
+  qualified
+  disqualified
+  converted
+}
+
+enum DealHealth {
+  healthy
+  at_risk
+  stalled
+  unknown
+}
+
+enum ActivityKind {
+  email
+  call
+  meeting
+  whatsapp
+  note
+  task
+}
+
+/// Shared by Conversation.direction, Message.direction, and Activity.direction —
+/// all three used the identical 'inbound' | 'outbound' literal union in Mongoose.
+enum Direction {
+  inbound
+  outbound
+}
+
+enum Sentiment {
+  positive
+  neutral
+  negative
+}
+
+enum TaskPriority {
+  low
+  medium
+  high
+  urgent
+}
+
+enum TaskStatus {
+  open
+  in_progress
+  completed
+  cancelled
+}
+
+enum RecommendationAction {
+  send_email
+  send_whatsapp
+  make_call
+  schedule_meeting
+  send_proposal
+  share_documentation
+  create_task
+  update_deal
+}
+
+enum RecommendationStatus {
+  pending
+  approved
+  rejected
+  executed
+  expired
+}
+
+enum PermissionRequirement {
+  allowed
+  approval_required
+}
+
+/// Channel used by an AIRecommendation — distinct from ActivityKind/ConversationChannel
+/// because Mongoose declared it as its own inline union including 'crm'.
+enum RecommendationChannel {
+  email
+  whatsapp
+  call
+  meeting
+  proposal
+  task
+  crm
+}
+
+enum InsightType {
+  no_activity
+  proposal_viewed_multiple
+  decision_maker_engaged
+  stage_stalled
+  deal_at_risk
+  hot_lead
+  positive_momentum
+}
+
+enum InsightSeverity {
+  info
+  warning
+  critical
+}
+
+enum NotificationType {
+  follow_up_due
+  deal_at_risk
+  ai_recommendation
+  approval_required
+  meeting_reminder
+  integration_error
+  import_completed
+}
+
+enum AuditActorType {
+  user
+  ai_agent
+  system
+}
+
+enum IntegrationProvider {
+  gmail
+  outlook
+  smtp
+  google_calendar
+  outlook_calendar
+  whatsapp
+  twilio
+  vonage
+  salesforce
+  hubspot
+  pipedrive
+}
+
+enum IntegrationCategory {
+  email
+  calendar
+  whatsapp
+  telephony
+  crm_import
+}
+
+enum IntegrationEnvironment {
+  production
+  development
+}
+
+enum IntegrationStatus {
+  not_connected
+  connected
+  error
+}
+
+enum PermissionMode {
+  allowed
+  approval_required
+  disabled
+}
+
+enum EmailStatus {
+  draft
+  sent
+  delivered
+  opened
+  failed
+}
+
+enum MessageChannel {
+  whatsapp
+}
+
+enum MessageStatus {
+  draft
+  sent
+  delivered
+  read
+  failed
+}
+
+enum MeetingStatus {
+  scheduled
+  completed
+  cancelled
+  no_show
+}
+
+enum ReportDataset {
+  deals
+  leads
+  activities
+  contacts
+}
+
+enum ReportChartType {
+  table
+  bar
+  line
+  pie
+}
+
+enum ReportMetric {
+  count
+  sum
+  avg
+}
+
+enum ContentDraftType {
+  email
+  whatsapp
+  call_script
+  proposal
+}
+
+enum ContentDraftStatus {
+  draft
+  approved
+  sent
+}
+
+enum ApprovalStatus {
+  pending
+  approved
+  rejected
+}
+
+enum PermissionCategory {
+  emailSending
+  whatsappSending
+  crmUpdates
+  meetingScheduling
+  proposalCreation
+  taskCreation
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Organization + its embedded-array-turned-child-tables
+// ─────────────────────────────────────────────────────────────────────────
+
+model Organization {
+  id                    String        @id @default(uuid())
+  name                  String
+  industry              Industry      @default(Other)
+  customIndustry        String?
+  businessModel         BusinessModel @default(B2B)
+  companySize           String        @default("")
+  salesTeamSize         String        @default("")
+  productType           String        @default("")
+  averageDealSize       Float?
+  salesCycleDays        Int?
+  commonObjections      String[]      @default([])
+  qualificationCriteria String[]      @default([])
+  onboardingCompleted   Boolean       @default(false)
+  onboardingStep        Int           @default(1)
+  ssoEnabled            Boolean       @default(false)
+  ipAllowlist           String[]      @default([])
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  dealStages    DealStageConfig[]
+  activityTypes ActivityTypeConfig[]
+  customFields  CustomFieldConfig[]
+
+  users            User[]
+  leads            Lead[]
+  contacts         Contact[]
+  companies        Company[]
+  deals            Deal[]
+  activities       Activity[]
+  conversations    Conversation[]
+  products         Product[]
+  tasks            Task[]
+  recommendations  AIRecommendation[]
+  insights         AIInsight[]
+  notifications    Notification[]
+  auditLogs        AuditLog[]
+  integrations     Integration[]
+  autonomySettings AutonomySettings?
+  emails           Email[]
+  messages         Message[]
+  meetings         Meeting[]
+  reports          Report[]
+  contentDrafts    ContentDraft[]
+  approvals        Approval[]
+
+  @@map("organizations")
+}
+
+/// Was Organization.dealStages: IDealStageConfig[] (embedded array). Made a real
+/// child table — the app looks up/mutates individual stages by key, reorders them,
+/// and needs per-org uniqueness on `key`, all of which are relational operations
+/// (WHERE organizationId = ? AND key = ?) rather than whole-document reads, so a
+/// child table is a better fit here than a JSON blob.
+model DealStageConfig {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  key            String
+  label          String
+  order          Int
+  probability    Int
+  isWon          Boolean      @default(false)
+  isLost         Boolean      @default(false)
+
+  deals Deal[]
+
+  @@unique([organizationId, key])
+  @@index([organizationId])
+  @@map("deal_stage_configs")
+}
+
+/// Was Organization.activityTypes: IActivityTypeConfig[]. Same reasoning as
+/// DealStageConfig — looked up by key, per-org configurable list.
+model ActivityTypeConfig {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  key            String
+  label          String
+  icon           String       @default("activity")
+
+  @@unique([organizationId, key])
+  @@index([organizationId])
+  @@map("activity_type_configs")
+}
+
+/// Was Organization.customFields: ICustomFieldConfig[]. Same reasoning — the
+/// onboarding/settings flow adds and removes individual custom field definitions
+/// by id by key, per entity type.
+model CustomFieldConfig {
+  id             String            @id @default(uuid())
+  organizationId String
+  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  entity         CustomFieldEntity
+  key            String
+  label          String
+  type           CustomFieldType
+  options        String[]          @default([])
+  required       Boolean           @default(false)
+
+  @@unique([organizationId, entity, key])
+  @@index([organizationId])
+  @@map("custom_field_configs")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Auth
+// ─────────────────────────────────────────────────────────────────────────
+
+model User {
+  id                  String       @id @default(uuid())
+  organizationId      String
+  organization        Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name                String
+  email               String
+  passwordHash        String
+  role                UserRole     @default(sales_rep)
+  title               String?
+  avatarColor         String       @default("#6366f1")
+  isActive            Boolean      @default(true)
+  lastLoginAt         DateTime?
+  refreshTokenVersion Int          @default(0)
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+
+  refreshTokens RefreshToken[]
+
+  leadsOwned              Lead[]             @relation("LeadOwner")
+  leadsCreated            Lead[]             @relation("LeadCreatedBy")
+  contactsOwned           Contact[]          @relation("ContactOwner")
+  contactsCreated         Contact[]          @relation("ContactCreatedBy")
+  companiesOwned          Company[]          @relation("CompanyOwner")
+  companiesCreated        Company[]          @relation("CompanyCreatedBy")
+  dealsOwned              Deal[]             @relation("DealOwner")
+  dealsCreated            Deal[]             @relation("DealCreatedBy")
+  activitiesOwned         Activity[]         @relation("ActivityOwner")
+  activitiesAssigned      Activity[]         @relation("ActivityAssignedTo")
+  activitiesCreated       Activity[]         @relation("ActivityCreatedBy")
+  conversationsCreated    Conversation[]     @relation("ConversationCreatedBy")
+  tasksAssigned           Task[]             @relation("TaskAssignedTo")
+  tasksCreated            Task[]             @relation("TaskCreatedBy")
+  recommendationsTargeted AIRecommendation[] @relation("RecommendationTargetUser")
+  recommendationsApproved AIRecommendation[] @relation("RecommendationApprovedBy")
+  notifications           Notification[]     @relation("NotificationUser")
+  auditLogsActed          AuditLog[]         @relation("AuditLogActor")
+  auditLogsApproved       AuditLog[]         @relation("AuditLogApprovedBy")
+  integrationsConnected   Integration[]      @relation("IntegrationConnectedBy")
+  autonomySettingsUpdated AutonomySettings[] @relation("AutonomySettingsUpdatedBy")
+  emailsCreated           Email[]            @relation("EmailCreatedBy")
+  messagesCreated         Message[]          @relation("MessageCreatedBy")
+  meetingsOrganized       Meeting[]          @relation("MeetingOrganizer")
+  meetingsCreated         Meeting[]          @relation("MeetingCreatedBy")
+  reportsCreated          Report[]           @relation("ReportCreatedBy")
+  contentDraftsCreated    ContentDraft[]     @relation("ContentDraftCreatedBy")
+  approvalsDecided        Approval[]         @relation("ApprovalDecidedBy")
+
+  @@unique([organizationId, email])
+  @@index([organizationId])
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String
+  userAgent String?
+  ip        String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Core CRM
+// ─────────────────────────────────────────────────────────────────────────
+
+model Lead {
+  id                   String       @id @default(uuid())
+  organizationId       String
+  organization         Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name                 String
+  email                String?
+  phone                String?
+  companyName          String?
+  jobTitle             String?
+  source               String       @default("manual")
+  status               LeadStatus   @default(new)
+  score                Int          @default(0)
+  scoreBreakdown       Json?
+  ownerId              String?
+  owner                User?        @relation("LeadOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  convertedToContactId String?      @unique
+  convertedToContact   Contact?     @relation("LeadConvertedToContact", fields: [convertedToContactId], references: [id], onDelete: SetNull)
+  convertedToDealId    String?      @unique
+  convertedToDeal      Deal?        @relation("LeadConvertedToDeal", fields: [convertedToDealId], references: [id], onDelete: SetNull)
+  notes                String?
+  customFields         Json         @default("{}")
+  lastActivityAt       DateTime?
+  createdById          String
+  createdBy            User         @relation("LeadCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+
+  activities      Activity[]
+  conversations   Conversation[]
+  tasks           Task[]
+  recommendations AIRecommendation[]
+  insights        AIInsight[]
+  approvals       Approval[]
+
+  @@index([organizationId])
+  @@index([organizationId, status])
+  @@index([organizationId, score])
+  @@map("leads")
+}
+
+model Contact {
+  id              String       @id @default(uuid())
+  organizationId  String
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name            String
+  email           String?
+  phone           String?
+  companyId       String?
+  company         Company?     @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  jobTitle        String?
+  ownerId         String?
+  owner           User?        @relation("ContactOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  source          String?
+  tags            String[]     @default([])
+  isDecisionMaker Boolean      @default(false)
+  customFields    Json         @default("{}")
+  createdById     String
+  createdBy       User         @relation("ContactCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  leadConvertedFrom Lead?              @relation("LeadConvertedToContact")
+  deals             Deal[]
+  activities        Activity[]
+  conversations     Conversation[]
+  tasks             Task[]
+  recommendations   AIRecommendation[]
+  emails            Email[]
+  messages          Message[]
+  meetings          Meeting[]
+  contentDrafts     ContentDraft[]
+  approvals         Approval[]
+
+  @@index([organizationId])
+  @@map("contacts")
+}
+
+model Company {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  industry       String?
+  website        String?
+  employees      Int?
+  location       String?
+  notes          String?
+  ownerId        String?
+  owner          User?        @relation("CompanyOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  customFields   Json         @default("{}")
+  createdById    String
+  createdBy      User         @relation("CompanyCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  contacts   Contact[]
+  deals      Deal[]
+  activities Activity[]
+
+  @@index([organizationId])
+  @@map("companies")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Deals
+// ─────────────────────────────────────────────────────────────────────────
+
+model Deal {
+  id                String           @id @default(uuid())
+  organizationId    String
+  organization      Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name              String
+  companyId         String?
+  company           Company?         @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  primaryContactId  String?
+  primaryContact    Contact?         @relation(fields: [primaryContactId], references: [id], onDelete: SetNull)
+  ownerId           String
+  owner             User             @relation("DealOwner", fields: [ownerId], references: [id], onDelete: Restrict)
+  value             Float            @default(0)
+  currency          String           @default("USD")
+  stageKey          String           @default("lead")
+  stageConfigId     String?
+  stageConfig       DealStageConfig? @relation(fields: [stageConfigId], references: [id], onDelete: SetNull)
+  probability       Int              @default(10)
+  expectedCloseDate DateTime?
+  source            String?
+
+  /// Was Deal.aiScore: IDealScore (probability/health/factors[]/explanation/
+  /// recommendation/calculatedAt). Kept as JSON — it's a computed snapshot the
+  /// scoring service reads and rewrites as a whole, never queried by an inner
+  /// field (e.g. no "find deals where factors[2].weight > x").
+  aiScore Json?
+
+  lastActivityAt DateTime?
+  wonAt          DateTime?
+  lostAt         DateTime?
+  lostReason     String?
+  notes          String?
+  customFields   Json      @default("{}")
+  createdById    String
+  createdBy      User      @relation("DealCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  products          DealProduct[]
+  activities        Activity[]
+  conversations     Conversation[]
+  tasks             Task[]
+  recommendations   AIRecommendation[]
+  insights          AIInsight[]
+  emails            Email[]
+  messages          Message[]
+  meetings          Meeting[]
+  contentDrafts     ContentDraft[]
+  approvals         Approval[]
+  convertedFromLead Lead?              @relation("LeadConvertedToDeal")
+
+  @@index([organizationId])
+  @@index([organizationId, stageKey])
+  @@index([organizationId, ownerId])
+  @@map("deals")
+}
+
+/// Was Deal.products: IDealProductLine[] (product + quantity + price). A real
+/// join table, not JSON, because each line genuinely references a Product row
+/// by foreign key.
+model DealProduct {
+  id        String   @id @default(uuid())
+  dealId    String
+  deal      Deal     @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  productId String?
+  product   Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+  quantity  Int      @default(1)
+  price     Float    @default(0)
+
+  @@index([dealId])
+  @@map("deal_products")
+}
+
+model Product {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  description    String?
+  price          Float        @default(0)
+  currency       String       @default("USD")
+  sku            String?
+  isActive       Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  dealLines DealProduct[]
+
+  @@index([organizationId])
+  @@map("products")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Activities / Conversations / Tasks
+// ─────────────────────────────────────────────────────────────────────────
+
+model Activity {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  type           ActivityKind
+  subject        String
+  body           String?
+  dealId         String?
+  deal           Deal?        @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  leadId         String?
+  lead           Lead?        @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  contactId      String?
+  contact        Contact?     @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  companyId      String?
+  company        Company?     @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  ownerId        String
+  owner          User         @relation("ActivityOwner", fields: [ownerId], references: [id], onDelete: Restrict)
+  assignedToId   String?
+  assignedTo     User?        @relation("ActivityAssignedTo", fields: [assignedToId], references: [id], onDelete: SetNull)
+  scheduledAt    DateTime?
+  completedAt    DateTime?
+  isCompleted    Boolean      @default(false)
+  direction      Direction?
+  createdById    String
+  createdBy      User         @relation("ActivityCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([organizationId])
+  @@index([organizationId, dealId, createdAt])
+  @@index([organizationId, createdAt])
+  @@map("activities")
+}
+
+model Conversation {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  channel        ActivityKind
+  dealId         String?
+  deal           Deal?        @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  contactId      String?
+  contact        Contact?     @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  leadId         String?
+  lead           Lead?        @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  participant    String
+  content        String
+  direction      Direction    @default(outbound)
+  sentiment      Sentiment?
+  aiSummary      String?
+  occurredAt     DateTime     @default(now())
+  createdById    String
+  createdBy      User         @relation("ConversationCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([organizationId])
+  @@index([organizationId, dealId, occurredAt])
+  @@map("conversations")
+}
+
+model Task {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  title          String
+  description    String?
+  dealId         String?
+  deal           Deal?        @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  leadId         String?
+  lead           Lead?        @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  contactId      String?
+  contact        Contact?     @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  assignedToId   String
+  assignedTo     User         @relation("TaskAssignedTo", fields: [assignedToId], references: [id], onDelete: Restrict)
+  dueDate        DateTime?
+  priority       TaskPriority @default(medium)
+  status         TaskStatus   @default(open)
+  completedAt    DateTime?
+  createdByAI    Boolean      @default(false)
+  createdById    String
+  createdBy      User         @relation("TaskCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([organizationId, assignedToId, status, dueDate])
+  @@map("tasks")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// AI: recommendations, insights, content drafts, approvals
+// ─────────────────────────────────────────────────────────────────────────
+
+model AIRecommendation {
+  id                    String                 @id @default(uuid())
+  organizationId        String
+  organization          Organization           @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  dealId                String?
+  deal                  Deal?                  @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  leadId                String?
+  lead                  Lead?                  @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  contactId             String?
+  contact               Contact?               @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  targetUserId          String
+  targetUser            User                   @relation("RecommendationTargetUser", fields: [targetUserId], references: [id], onDelete: Restrict)
+  action                RecommendationAction
+  channel               RecommendationChannel?
+  title                 String
+  reason                String
+  priority              TaskPriority           @default(medium)
+  confidence            Int                    @default(60)
+  /// Was { subject?, body? } — small optional nested object, kept as JSON.
+  generatedContent      Json?
+  permissionRequirement PermissionRequirement  @default(approval_required)
+  status                RecommendationStatus   @default(pending)
+  approvedById          String?
+  approvedBy            User?                  @relation("RecommendationApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt            DateTime?
+  rejectedReason        String?
+  executedAt            DateTime?
+  expiresAt             DateTime?
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+
+  @@index([organizationId])
+  @@index([organizationId, dealId])
+  @@index([targetUserId])
+  @@index([organizationId, status, createdAt])
+  @@map("ai_recommendations")
+}
+
+model AIInsight {
+  id             String          @id @default(uuid())
+  organizationId String
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  dealId         String?
+  deal           Deal?           @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  leadId         String?
+  lead           Lead?           @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  type           InsightType
+  severity       InsightSeverity @default(info)
+  message        String
+  data           Json            @default("{}")
+  dedupeKey      String
+  isRead         Boolean         @default(false)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@unique([organizationId, dedupeKey])
+  @@map("ai_insights")
+}
+
+model ContentDraft {
+  id                String             @id @default(uuid())
+  organizationId    String
+  organization      Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  type              ContentDraftType
+  dealId            String?
+  deal              Deal?              @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  contactId         String?
+  contact           Contact?           @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  purpose           String?
+  tone              String?
+  section           String?
+  /// Shape varies by `type`: {subject,body} | {body} | CallScript | {title,content} — JSON.
+  content           Json
+  status            ContentDraftStatus @default(draft)
+  regeneratedFromId String?            @unique
+  regeneratedFrom   ContentDraft?      @relation("ContentDraftRegeneration", fields: [regeneratedFromId], references: [id], onDelete: SetNull)
+  regeneratedInto   ContentDraft?      @relation("ContentDraftRegeneration")
+  createdById       String
+  createdBy         User               @relation("ContentDraftCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  approvals Approval[]
+
+  @@index([organizationId, dealId, createdAt])
+  @@map("content_drafts")
+}
+
+model Approval {
+  id                 String             @id @default(uuid())
+  organizationId     String
+  organization       Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  title              String
+  reason             String
+  dealId             String?
+  deal               Deal?              @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  leadId             String?
+  lead               Lead?              @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  contactId          String?
+  contact            Contact?           @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  contentDraftId     String?
+  contentDraft       ContentDraft?      @relation(fields: [contentDraftId], references: [id], onDelete: SetNull)
+  confidence         Int                @default(50)
+  permissionCategory PermissionCategory
+  status             ApprovalStatus     @default(pending)
+  decidedById        String?
+  decidedBy          User?              @relation("ApprovalDecidedBy", fields: [decidedById], references: [id], onDelete: SetNull)
+  decidedAt          DateTime?
+  rejectedReason     String?
+  autoExecuted       Boolean            @default(false)
+  dedupeKey          String
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  @@index([organizationId, dealId])
+  @@index([organizationId, status, createdAt])
+  @@index([organizationId, dedupeKey])
+  @@map("approvals")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Notifications / Audit / Settings
+// ─────────────────────────────────────────────────────────────────────────
+
+model Notification {
+  id             String           @id @default(uuid())
+  organizationId String
+  organization   Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User             @relation("NotificationUser", fields: [userId], references: [id], onDelete: Cascade)
+  type           NotificationType
+  title          String
+  message        String
+  link           String?
+  isRead         Boolean          @default(false)
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  @@index([organizationId])
+  @@index([userId, isRead, createdAt])
+  @@map("notifications")
+}
+
+model AuditLog {
+  id               String         @id @default(uuid())
+  organizationId   String
+  organization     Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  actorType        AuditActorType
+  actorId          String?
+  actor            User?          @relation("AuditLogActor", fields: [actorId], references: [id], onDelete: SetNull)
+  action           String
+  entityType       String
+  entityId         String?
+  before           Json?
+  after            Json?
+  approvalRequired Boolean        @default(false)
+  approvedById     String?
+  approvedBy       User?          @relation("AuditLogApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  metadata         Json?
+  createdAt        DateTime       @default(now())
+
+  @@index([organizationId, createdAt])
+  @@index([organizationId, entityType, entityId])
+  @@map("audit_logs")
+}
+
+model Integration {
+  id             String                 @id @default(uuid())
+  organizationId String
+  organization   Organization           @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  provider       IntegrationProvider
+  category       IntegrationCategory
+  environment    IntegrationEnvironment @default(development)
+  status         IntegrationStatus      @default(not_connected)
+  connectedById  String?
+  connectedBy    User?                  @relation("IntegrationConnectedBy", fields: [connectedById], references: [id], onDelete: SetNull)
+  connectedAt    DateTime?
+  lastSyncAt     DateTime?
+  lastError      String?
+  config         Json                   @default("{}")
+  createdAt      DateTime               @default(now())
+  updatedAt      DateTime               @updatedAt
+
+  @@unique([organizationId, provider])
+  @@map("integrations")
+}
+
+model AutonomySettings {
+  id             String       @id @default(uuid())
+  organizationId String       @unique
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  level          Int          @default(1)
+
+  emailSending      PermissionMode @default(approval_required)
+  whatsappSending   PermissionMode @default(approval_required)
+  crmUpdates        PermissionMode @default(approval_required)
+  meetingScheduling PermissionMode @default(approval_required)
+  proposalCreation  PermissionMode @default(approval_required)
+  taskCreation      PermissionMode @default(approval_required)
+
+  updatedById String?
+  updatedBy   User?    @relation("AutonomySettingsUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("autonomy_settings")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Communications: Email / Message / Meeting
+// ─────────────────────────────────────────────────────────────────────────
+
+model Email {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  dealId         String?
+  deal           Deal?        @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  contactId      String?
+  contact        Contact?     @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  from           String
+  to             String
+  subject        String
+  body           String
+  status         EmailStatus  @default(draft)
+  provider       String       @default("development")
+  generatedByAI  Boolean      @default(false)
+  sentAt         DateTime?
+  openedAt       DateTime?
+  error          String?
+  createdById    String
+  createdBy      User         @relation("EmailCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([organizationId])
+  @@map("emails")
+}
+
+model Message {
+  id             String         @id @default(uuid())
+  organizationId String
+  organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  dealId         String?
+  deal           Deal?          @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  contactId      String?
+  contact        Contact?       @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  channel        MessageChannel @default(whatsapp)
+  direction      Direction
+  fromNumber     String
+  toNumber       String
+  body           String
+  status         MessageStatus  @default(draft)
+  provider       String         @default("development")
+  generatedByAI  Boolean        @default(false)
+  createdById    String?
+  createdBy      User?          @relation("MessageCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  @@index([organizationId])
+  @@map("messages")
+}
+
+model Meeting {
+  id                 String        @id @default(uuid())
+  organizationId     String
+  organization       Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  title              String
+  dealId             String?
+  deal               Deal?         @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  contactId          String?
+  contact            Contact?      @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  organizerId        String
+  organizer          User          @relation("MeetingOrganizer", fields: [organizerId], references: [id], onDelete: Restrict)
+  attendees          String[]      @default([])
+  startTime          DateTime
+  endTime            DateTime
+  location           String?
+  meetingLink        String?
+  provider           String        @default("development")
+  status             MeetingStatus @default(scheduled)
+  aiPreparationNotes String?
+  loggedActivityId   String?       @unique
+  createdById        String
+  createdBy          User          @relation("MeetingCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  @@index([organizationId, startTime])
+  @@map("meetings")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Reports
+// ─────────────────────────────────────────────────────────────────────────
+
+model Report {
+  id             String          @id @default(uuid())
+  organizationId String
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  dataset        ReportDataset
+  fields         String[]        @default([])
+  /// Was IReportFilter[] ({field, operator, value}[]) — small, replayed as a
+  /// whole against the dataset at run time, never queried relationally itself.
+  filters        Json            @default("[]")
+  groupBy        String?
+  metric         ReportMetric?
+  metricField    String?
+  chartType      ReportChartType @default(table)
+  dateRangeStart DateTime?
+  dateRangeEnd   DateTime?
+  scheduleCron   String?
+  createdById    String
+  createdBy      User            @relation("ReportCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@index([organizationId])
+  @@map("reports")
+}
